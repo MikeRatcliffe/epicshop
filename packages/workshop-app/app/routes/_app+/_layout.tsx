@@ -48,6 +48,7 @@ import {
 import { useOptionalUser } from '#app/components/user.tsx'
 import { cn } from '#app/utils/misc.tsx'
 import { usePresence, type User } from '#app/utils/presence.tsx'
+import { CoachKodyButton } from '../coach-kody.tsx'
 import {
 	useExerciseProgressClassName,
 	useNextExerciseRoute,
@@ -731,7 +732,14 @@ function MobileNavigation({
 							</Link>
 						</SimpleTooltip>
 					) : null}
-					{ENV.EPICSHOP_DEPLOYED ? null : user && nextExerciseRoute ? (
+					{ENV.EPICSHOP_DEPLOYED || !user ? null : (
+						<SimpleTooltip content={isMenuOpened ? null : 'Ask Coach Kody'}>
+							<div className="flex h-14 w-14 flex-shrink-0 items-center justify-center border-l px-4 py-4">
+								<CoachKodyButton />
+							</div>
+						</SimpleTooltip>
+					)}
+					{ENV.EPICSHOP_DEPLOYED || !user || !nextExerciseRoute ? null : (
 						<SimpleTooltip
 							content={isMenuOpened ? null : 'Continue to next lesson'}
 						>
@@ -739,7 +747,7 @@ function MobileNavigation({
 								to={nextExerciseRoute}
 								prefetch="intent"
 								className={clsx(
-									'flex h-14 w-full items-center space-x-3 border-l px-4 py-4 pl-[18px] no-underline hover:underline',
+									'flex h-14 w-14 items-center space-x-3 border-l px-4 py-4 no-underline hover:underline',
 								)}
 								state={{ from: 'continue next lesson button' }}
 							>
@@ -758,7 +766,8 @@ function MobileNavigation({
 								)}
 							</Link>
 						</SimpleTooltip>
-					) : null}
+					)}
+					<div className="w-full" />
 					<div
 						className={cn(
 							'flex h-14 w-14 items-center justify-center self-start p-4 sm:mb-4 sm:w-full',
@@ -1044,6 +1053,25 @@ function Navigation({
 							</Link>
 						</SimpleTooltip>
 					) : null}
+					{ENV.EPICSHOP_DEPLOYED || !user ? null : (
+						<SimpleTooltip content={isMenuOpened ? null : 'Ask Coach Kody'}>
+							<div className="flex h-14 w-full items-center justify-start gap-3 border-t px-4 py-4">
+								<div className="flex aspect-square h-full items-center justify-center">
+									<CoachKodyButton />
+								</div>
+								{isMenuOpened ? (
+									<motion.div
+										// @ts-expect-error framer-motion + latest typescript types has issues
+										className="flex items-center whitespace-nowrap"
+										initial={{ opacity: 0 }}
+										animate={{ opacity: 1 }}
+									>
+										Ask Coach Kody
+									</motion.div>
+								) : null}
+							</div>
+						</SimpleTooltip>
+					)}
 					{ENV.EPICSHOP_DEPLOYED ? null : user && nextExerciseRoute ? (
 						<SimpleTooltip
 							content={isMenuOpened ? null : 'Continue to next lesson'}

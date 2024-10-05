@@ -1,11 +1,13 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { type CacheEntry } from '@epic-web/cachified'
-import { remember } from '@epic-web/remember'
 /// TODO: figure out why this import is necessary (without it tsc seems to not honor the boolean reset 🤷‍♂️)
 import '@total-typescript/ts-reset'
+import chokidar from 'chokidar'
+import closeWithGrace from 'close-with-grace'
 import { execa } from 'execa'
 import fsExtra from 'fs-extra'
+// tried to switch to globby but couldn't figure it out for the problem/solution/example apps 🤷‍♂️
 import { glob } from 'glob'
 import { globby, isGitIgnored } from 'globby'
 import { z } from 'zod'
@@ -17,15 +19,14 @@ import {
 	problemAppCache,
 	solutionAppCache,
 } from './cache.server.js'
-import { getWatcher, withoutWatcher } from './change-tracker.server.js'
 import { compileMdx } from './compile-mdx.server.js'
 import {
-	bustWorkshopConfigCache,
 	getAppConfig,
 	getStackBlitzUrl,
 	getWorkshopConfig,
 } from './config.server.js'
 import { getEnv, init as initEnv } from './env.server.js'
+import { getDirModifiedTime } from './modified-time.server.js'
 import {
 	closeProcess,
 	isAppRunning,
@@ -211,12 +212,7 @@ async function firstToExist(...files: Array<string>) {
 	return index === -1 ? null : files[index]
 }
 
-export const modifiedTimes = remember(
-	'modified_times',
-	() => new Map<string, number>(),
-)
-
-export function init() {
+export async function init() {
 	if (initialized) return
 
 	initialized = true
@@ -228,37 +224,49 @@ export function init() {
 
 	global.ENV = getEnv()
 
-	getWatcher()?.on('all', handleFileChanges)
-}
+	if (!ENV.EPICSHOP_DEPLOYED) {
+		const isIgnored = await isGitIgnored({ cwd: workshopRoot })
 
-async function handleFileChanges(
-	event: string,
-	filePath: string,
-): Promise<void> {
-	if (filePath === path.join(workshopRoot, 'package.json')) {
-		bustWorkshopConfigCache()
+		// watch the README, FINISHED, and package.json for changes that affect the apps
+		const filesToWatch = ['README.mdx', 'FINISHED.mdx', 'package.json']
+		const watcher = chokidar.watch(['examples', 'playground', 'exercises'], {
+			cwd: workshopRoot,
+			ignoreInitial: true,
+			ignored(filePath, stats) {
+				if (isIgnored(filePath)) return true
+				if (filePath.includes('.git')) return true
+
+				if (stats?.isDirectory()) {
+					if (filePath.endsWith('playground')) return false
+					const pathParts = filePath.split(path.sep)
+					if (pathParts.at(-2) === 'examples') return false
+
+					// steps
+					if (pathParts.at(-3) === 'exercises') return false
+
+					// exercises
+					if (pathParts.at(-2) === 'exercises') return false
+
+					// the exercise dir itself
+					if (pathParts.at(-1) === 'exercises') return false
+					return true
+				}
+
+				return stats?.isFile()
+					? !filesToWatch.some((file) => filePath.endsWith(file))
+					: false
+			},
+		})
+
+		watcher.on('all', () => {
+			void getApps({ forceFresh: true })
+		})
+
+		closeWithGrace(() => watcher.close())
 	}
-	const apps = await getApps()
-	for (const app of apps) {
-		if (filePath.startsWith(app.fullPath)) {
-			modifiedTimes.set(app.fullPath, Date.now())
-			break
-		}
-	}
 }
 
-function getForceFresh(cacheEntry: CacheEntry | null | undefined) {
-	if (!cacheEntry) return true
-	const latestModifiedTime = Math.max(...Array.from(modifiedTimes.values()))
-	if (!latestModifiedTime) return undefined
-	return latestModifiedTime > cacheEntry.metadata.createdTime ? true : undefined
-}
-
-export function setModifiedTimesForDir(dir: string) {
-	modifiedTimes.set(dir, Date.now())
-}
-
-export function getForceFreshForDir(
+export async function getForceFreshForDir(
 	cacheEntry: CacheEntry | null | undefined,
 	...dirs: Array<string | undefined | null>
 ) {
@@ -269,10 +277,13 @@ export function getForceFreshForDir(
 		}
 	}
 	if (!cacheEntry) return true
-	const latestModifiedTime = truthyDirs.reduce((latest, dir) => {
-		const modifiedTime = modifiedTimes.get(dir)
-		return modifiedTime && modifiedTime > latest ? modifiedTime : latest
-	}, 0)
+	const modifiedTimes = await Promise.all(
+		truthyDirs.map((dir) => getDirModifiedTime(dir)),
+	)
+	const latestModifiedTime = modifiedTimes.reduce(
+		(latest, time) => (time > latest ? time : latest),
+		0,
+	)
 	if (!latestModifiedTime) return undefined
 	return latestModifiedTime > cacheEntry.metadata.createdTime ? true : undefined
 }
@@ -387,7 +398,7 @@ export async function getApps({
 	request,
 	forceFresh,
 }: CachifiedOptions & { forceFresh?: boolean } = {}): Promise<Array<App>> {
-	if (!initialized) init()
+	if (!initialized) await init()
 
 	const key = 'apps'
 	const apps = await cachified({
@@ -397,10 +408,11 @@ export async function getApps({
 		timingKey: `apps_${appCallCount++}`,
 		request,
 		// This entire cache is to avoid a single request getting a fresh value
-		// multiple times unnecessarily (because getApps is called many times)
+		// multiple times unnecessarily (because getApps is called many times per request)
 		ttl: 1000 * 60 * 60 * 24,
-		forceFresh: forceFresh ?? getForceFresh(appsCache.get(key)),
+		forceFresh,
 		getFreshValue: async () => {
+			// FIXME: this is incredibly slow and I don't know what to do about it...
 			const playgroundApp = await getPlaygroundApp({ request, timings })
 			const problemApps = await getProblemApps({ request, timings })
 			const solutionApps = await getSolutionApps({ request, timings })
@@ -575,6 +587,9 @@ async function getFullPathFromAppName(appName: string) {
 			info.exerciseNumber === exerciseNumber && info.stepNumber === stepNumber
 		)
 	})
+	if (!dir) {
+		console.warn(`Cannot find directory for app name ${appName}`)
+	}
 	return dir ?? appName
 }
 
@@ -713,7 +728,7 @@ export async function getPlaygroundApp({
 		timings,
 		timingKey: playgroundDir.replace(`${playgroundDir}${path.sep}`, ''),
 		request,
-		forceFresh: getForceFreshForDir(
+		forceFresh: await getForceFreshForDir(
 			playgroundCacheEntry,
 			playgroundDir,
 			baseAppFullPath,
@@ -803,7 +818,10 @@ async function getExampleApps({
 }: CachifiedOptions = {}): Promise<Array<ExampleApp>> {
 	const examplesDir = path.join(workshopRoot, 'examples')
 	const exampleDirs = (
-		await glob('*', { cwd: examplesDir, ignore: 'node_modules/**' })
+		await glob('*', {
+			cwd: examplesDir,
+			ignore: 'node_modules/**',
+		})
 	).map((p) => path.join(examplesDir, p))
 
 	const exampleApps: Array<ExampleApp> = []
@@ -819,7 +837,10 @@ async function getExampleApps({
 			timings,
 			timingKey: exampleDir.replace(`${examplesDir}${path.sep}`, ''),
 			request,
-			forceFresh: getForceFreshForDir(exampleAppCache.get(key), exampleDir),
+			forceFresh: await getForceFreshForDir(
+				exampleAppCache.get(key),
+				exampleDir,
+			),
 			getFreshValue: () =>
 				getExampleAppFromPath(exampleDir, index, request).catch((error) => {
 					console.error(error)
@@ -898,7 +919,7 @@ async function getSolutionApps({
 			request,
 			ttl: 1000 * 60 * 60 * 24,
 
-			forceFresh: getForceFreshForDir(
+			forceFresh: await getForceFreshForDir(
 				solutionAppCache.get(solutionDir),
 				solutionDir,
 			),
@@ -980,7 +1001,7 @@ async function getProblemApps({
 			request,
 			ttl: 1000 * 60 * 60 * 24,
 
-			forceFresh: getForceFreshForDir(
+			forceFresh: await getForceFreshForDir(
 				problemAppCache.get(problemDir),
 				problemDir,
 				solutionDir,
@@ -1134,144 +1155,139 @@ export async function setPlayground(
 	{ reset }: { reset?: boolean } = {},
 ) {
 	const destDir = path.join(workshopRoot, 'playground')
-	await withoutWatcher(async () => {
-		const isIgnored = await isGitIgnored({ cwd: srcDir })
-		const playgroundApp = await getAppByName('playground')
-		const playgroundWasRunning = playgroundApp
-			? isAppRunning(playgroundApp)
-			: false
-		if (playgroundApp && reset) {
-			await closeProcess(playgroundApp.name)
-			await fsExtra.remove(destDir)
-		}
-		const setPlaygroundTimestamp = Date.now()
+	const isIgnored = await isGitIgnored({ cwd: srcDir })
+	const playgroundApp = await getAppByName('playground')
+	const playgroundWasRunning = playgroundApp
+		? isAppRunning(playgroundApp)
+		: false
+	if (playgroundApp && reset) {
+		await closeProcess(playgroundApp.name)
+		await fsExtra.remove(destDir)
+	}
+	const setPlaygroundTimestamp = Date.now()
 
-		// run prepare-playground script if it exists
-		const preSetPlaygroundPath = await firstToExist(
-			path.join(srcDir, 'epicshop', 'pre-set-playground.js'),
-			path.join(workshopRoot, 'epicshop', 'pre-set-playground.js'),
-		)
-		if (preSetPlaygroundPath) {
-			await execa('node', [preSetPlaygroundPath], {
-				cwd: workshopRoot,
-				stdio: 'inherit',
+	// run prepare-playground script if it exists
+	const preSetPlaygroundPath = await firstToExist(
+		path.join(srcDir, 'epicshop', 'pre-set-playground.js'),
+		path.join(workshopRoot, 'epicshop', 'pre-set-playground.js'),
+	)
+	if (preSetPlaygroundPath) {
+		await execa('node', [preSetPlaygroundPath], {
+			cwd: workshopRoot,
+			stdio: 'inherit',
 
-				env: {
-					EPICSHOP_PLAYGROUND_TIMESTAMP: setPlaygroundTimestamp.toString(),
-					EPICSHOP_PLAYGROUND_DEST_DIR: destDir,
-					EPICSHOP_PLAYGROUND_SRC_DIR: srcDir,
-					EPICSHOP_PLAYGROUND_WAS_RUNNING: playgroundWasRunning.toString(),
-				} as any,
-			})
-		}
-
-		const basename = path.basename(srcDir)
-		// If we don't delete the destination node_modules first then copying the new
-		// node_modules has issues.
-		await fsExtra.remove(path.join(destDir, 'node_modules'))
-		// Copy the contents of the source directory to the destination directory recursively
-		await fsExtra.copy(srcDir, destDir, {
-			filter: async (srcFile, destFile) => {
-				if (
-					srcFile.includes(`${basename}${path.sep}build`) ||
-					srcFile.includes(`${basename}${path.sep}public${path.sep}build`)
-				) {
-					return false
-				}
-				if (srcFile === srcDir) return true
-				// we copy node_modules even though it's .gitignored
-				if (srcFile.includes('node_modules')) return true
-				// make sure .env is copied whether it's .gitignored or not
-				if (srcFile.endsWith('.env')) return true
-				if (isIgnored(srcFile)) return false
-
-				try {
-					const isDir = (await fsExtra.stat(srcFile)).isDirectory()
-					if (isDir) return true
-					const destIsDir = (await fsExtra.stat(destFile)).isDirectory()
-					// weird, but ok
-					if (destIsDir) return true
-
-					// it's better to check if the contents are the same before copying
-					// because it avoids unnecessary writes and reduces the impact on any
-					// file watchers (like the remix dev server). In practice, it's definitely
-					// slower, but it's better because it doesn't cause the dev server to
-					// crash as often.
-					const currentContents = await fsExtra.readFile(destFile)
-					const newContents = await fsExtra.readFile(srcFile)
-					if (currentContents.equals(newContents)) return false
-
-					return true
-				} catch {
-					// 🤷‍♂️ should probably copy it in this case
-					return true
-				}
-			},
+			env: {
+				EPICSHOP_PLAYGROUND_TIMESTAMP: setPlaygroundTimestamp.toString(),
+				EPICSHOP_PLAYGROUND_DEST_DIR: destDir,
+				EPICSHOP_PLAYGROUND_SRC_DIR: srcDir,
+				EPICSHOP_PLAYGROUND_WAS_RUNNING: playgroundWasRunning.toString(),
+			} as any,
 		})
+	}
 
-		async function getFiles(dir: string) {
-			// make globby friendly to windows
-			const dirPath = dir.replace(/\\/g, '/')
-			const files = await globby([`${dirPath}/**/*`, '!**/build/**/*'], {
-				onlyFiles: false,
-				dot: true,
-			})
-			return files.map((f) => f.replace(dirPath, ''))
-		}
+	const basename = path.basename(srcDir)
+	// If we don't delete the destination node_modules first then copying the new
+	// node_modules has issues.
+	await fsExtra.remove(path.join(destDir, 'node_modules'))
+	// Copy the contents of the source directory to the destination directory recursively
+	await fsExtra.copy(srcDir, destDir, {
+		filter: async (srcFile, destFile) => {
+			if (
+				srcFile.includes(`${basename}${path.sep}build`) ||
+				srcFile.includes(`${basename}${path.sep}public${path.sep}build`)
+			) {
+				return false
+			}
+			if (srcFile === srcDir) return true
+			// we copy node_modules even though it's .gitignored
+			if (srcFile.includes('node_modules')) return true
+			// make sure .env is copied whether it's .gitignored or not
+			if (srcFile.endsWith('.env')) return true
+			if (isIgnored(srcFile)) return false
 
-		// Remove files from destDir that were in destDir before but are not in srcDir
-		const srcFiles = await getFiles(srcDir)
-		const destFiles = await getFiles(destDir)
-		const filesToDelete = destFiles.filter(
-			(fileName) => !srcFiles.includes(fileName),
-		)
+			try {
+				const isDir = (await fsExtra.stat(srcFile)).isDirectory()
+				if (isDir) return true
+				const destIsDir = (await fsExtra.stat(destFile)).isDirectory()
+				// weird, but ok
+				if (destIsDir) return true
 
-		for (const fileToDelete of filesToDelete) {
-			await fsExtra.remove(path.join(destDir, fileToDelete))
-		}
+				// it's better to check if the contents are the same before copying
+				// because it avoids unnecessary writes and reduces the impact on any
+				// file watchers (like the remix dev server). In practice, it's definitely
+				// slower, but it's better because it doesn't cause the dev server to
+				// crash as often.
+				const currentContents = await fsExtra.readFile(destFile)
+				const newContents = await fsExtra.readFile(srcFile)
+				if (currentContents.equals(newContents)) return false
 
-		const appName = getAppName(srcDir)
-		await fsExtra.ensureDir(path.dirname(playgroundAppNameInfoPath))
-		await fsExtra.writeJSON(playgroundAppNameInfoPath, { appName })
-
-		const playgroundIsStillRunning = playgroundApp
-			? isAppRunning(playgroundApp)
-			: false
-		const restartPlayground = playgroundWasRunning && !playgroundIsStillRunning
-
-		// run postSet-playground script if it exists
-		const postSetPlaygroundPath = await firstToExist(
-			path.join(srcDir, 'epicshop', 'post-set-playground.js'),
-			path.join(workshopRoot, 'epicshop', 'post-set-playground.js'),
-		)
-		if (postSetPlaygroundPath) {
-			await execa('node', [postSetPlaygroundPath], {
-				cwd: workshopRoot,
-				stdio: 'inherit',
-
-				env: {
-					EPICSHOP_PLAYGROUND_TIMESTAMP: setPlaygroundTimestamp.toString(),
-					EPICSHOP_PLAYGROUND_SRC_DIR: srcDir,
-					EPICSHOP_PLAYGROUND_DEST_DIR: destDir,
-					EPICSHOP_PLAYGROUND_WAS_RUNNING: playgroundWasRunning.toString(),
-					EPICSHOP_PLAYGROUND_IS_STILL_RUNNING:
-						playgroundIsStillRunning.toString(),
-					EPICSHOP_PLAYGROUND_RESTART_PLAYGROUND: restartPlayground.toString(),
-				} as any,
-			})
-		}
-
-		// since we are running without the watcher we need to set the modified time
-		modifiedTimes.set(destDir, Date.now())
-
-		if (playgroundApp && restartPlayground) {
-			await runAppDev(playgroundApp)
-			await waitOnApp(playgroundApp)
-		}
+				return true
+			} catch {
+				// 🤷‍♂️ should probably copy it in this case
+				return true
+			}
+		},
 	})
 
-	// let the app know the playground changed
-	getWatcher()?.emit('all', 'playground', destDir)
+	async function getFiles(dir: string) {
+		// make globby friendly to windows
+		const dirPath = dir.replace(/\\/g, '/')
+		const files = await globby([`${dirPath}/**/*`, '!**/build/**/*'], {
+			onlyFiles: false,
+			dot: true,
+		})
+		return files.map((f) => f.replace(dirPath, ''))
+	}
+
+	// Remove files from destDir that were in destDir before but are not in srcDir
+	const srcFiles = await getFiles(srcDir)
+	const destFiles = await getFiles(destDir)
+	const filesToDelete = destFiles.filter(
+		(fileName) => !srcFiles.includes(fileName),
+	)
+
+	for (const fileToDelete of filesToDelete) {
+		await fsExtra.remove(path.join(destDir, fileToDelete))
+	}
+
+	const appName = getAppName(srcDir)
+	await fsExtra.ensureDir(path.dirname(playgroundAppNameInfoPath))
+	await fsExtra.writeJSON(playgroundAppNameInfoPath, { appName })
+
+	const playgroundIsStillRunning = playgroundApp
+		? isAppRunning(playgroundApp)
+		: false
+	const restartPlayground = playgroundWasRunning && !playgroundIsStillRunning
+
+	// run postSet-playground script if it exists
+	const postSetPlaygroundPath = await firstToExist(
+		path.join(srcDir, 'epicshop', 'post-set-playground.js'),
+		path.join(workshopRoot, 'epicshop', 'post-set-playground.js'),
+	)
+	if (postSetPlaygroundPath) {
+		await execa('node', [postSetPlaygroundPath], {
+			cwd: workshopRoot,
+			stdio: 'inherit',
+
+			env: {
+				EPICSHOP_PLAYGROUND_TIMESTAMP: setPlaygroundTimestamp.toString(),
+				EPICSHOP_PLAYGROUND_SRC_DIR: srcDir,
+				EPICSHOP_PLAYGROUND_DEST_DIR: destDir,
+				EPICSHOP_PLAYGROUND_WAS_RUNNING: playgroundWasRunning.toString(),
+				EPICSHOP_PLAYGROUND_IS_STILL_RUNNING:
+					playgroundIsStillRunning.toString(),
+				EPICSHOP_PLAYGROUND_RESTART_PLAYGROUND: restartPlayground.toString(),
+			} as any,
+		})
+	}
+
+	// since we are running without the watcher we need to set the modified time
+	void getDirModifiedTime(destDir, { forceFresh: true })
+
+	if (playgroundApp && restartPlayground) {
+		await runAppDev(playgroundApp)
+		await waitOnApp(playgroundApp)
+	}
 }
 
 /**
@@ -1294,35 +1310,6 @@ export async function getPlaygroundAppName() {
 	} catch {
 		return null
 	}
-}
-
-async function getDirModifiedTime(dir: string): Promise<number> {
-	// we can't use modifiedTimes because it only stores the modified times of
-	// things the app started.
-
-	const isIgnored = await isGitIgnored({ cwd: dir })
-	const files = await fs.promises.readdir(dir, { withFileTypes: true })
-
-	const modifiedTimes = await Promise.all(
-		files.map(async (file) => {
-			if (isIgnored(file.name)) return 0
-
-			const filePath = path.join(dir, file.name)
-			if (file.isDirectory()) {
-				return getDirModifiedTime(filePath)
-			} else {
-				try {
-					const { mtimeMs } = await fs.promises.stat(filePath)
-					return mtimeMs
-				} catch {
-					// Handle errors (e.g., file access permissions, file has been moved or deleted)
-					return 0
-				}
-			}
-		}),
-	)
-
-	return Math.max(0, ...modifiedTimes) // Ensure there is a default of 0 if all files are ignored
 }
 
 export function getAppDisplayName(a: App, allApps: Array<App>) {

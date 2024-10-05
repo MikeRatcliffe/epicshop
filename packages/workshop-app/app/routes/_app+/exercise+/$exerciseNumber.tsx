@@ -26,6 +26,7 @@ import {
 } from '@remix-run/react'
 import slugify from '@sindresorhus/slugify'
 import { EpicVideoInfoProvider } from '#app/components/epic-video.tsx'
+import { RevalidationWS } from '#app/components/revalidation-ws.js'
 import { type loader as rootLoader } from '#app/root.tsx'
 import { EditFileOnGitHub } from '#app/routes/launch-editor.tsx'
 import { ProgressToggle } from '#app/routes/progress.tsx'
@@ -178,6 +179,9 @@ export default function ExerciseNumberRoute() {
 					Start Learning
 				</Link>
 			</div>
+			{data.exerciseReadme.file ? (
+				<RevalidationWS watchPaths={[data.exerciseReadme.file]} />
+			) : null}
 		</main>
 	)
 }

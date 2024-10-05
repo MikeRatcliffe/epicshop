@@ -23,6 +23,7 @@ import * as React from 'react'
 import { EpicVideoInfoProvider } from '#app/components/epic-video.tsx'
 import { Loading } from '#app/components/loading.tsx'
 import { NavChevrons } from '#app/components/nav-chevrons.tsx'
+import { RevalidationWS } from '#app/components/revalidation-ws.js'
 import { type loader as rootLoader } from '#app/root.tsx'
 import { getEpicVideoInfos } from '#app/utils/epic-api.ts'
 import { Mdx } from '#app/utils/mdx.tsx'
@@ -167,6 +168,7 @@ export default function ExerciseFinished() {
 					workshopFormEmbedUrl={data.workshopFormEmbedUrl}
 				/>
 			</main>
+			<RevalidationWS watchPaths={['./exercises/FINISHED.mdx']} />
 		</div>
 	)
 }

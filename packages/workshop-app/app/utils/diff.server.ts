@@ -5,7 +5,6 @@ import {
 	getForceFreshForDir,
 	getRelativePath,
 	workshopRoot,
-	modifiedTimes,
 	type App,
 } from '@epic-web/workshop-utils/apps.server'
 import {
@@ -14,6 +13,7 @@ import {
 	diffFilesCache,
 } from '@epic-web/workshop-utils/cache.server'
 import { compileMarkdownString } from '@epic-web/workshop-utils/compile-mdx.server'
+import { getDirModifiedTime } from '@epic-web/workshop-utils/modified-time.server'
 import { type Timings } from '@epic-web/workshop-utils/timing.server'
 import { execa } from 'execa'
 import fsExtra from 'fs-extra'
@@ -212,7 +212,7 @@ async function copyUnignoredFiles(
 	await cachified({
 		key,
 		cache: diffCodeCache,
-		forceFresh: getForceFreshForDir(diffCodeCache.get(key), srcDir),
+		forceFresh: await getForceFreshForDir(diffCodeCache.get(key), srcDir),
 		async getFreshValue() {
 			const ig = ignore().add(ignoreList)
 
@@ -243,19 +243,20 @@ async function prepareForDiff(app1: App, app2: App) {
 	)
 	// if everything except the `name` property of the `package.json` is the same
 	// the don't bother copying it
-	const comparePkgJson = (pkg1: any, pkg2: any) => {
+	function comparePkgJson(pkg1: any, pkg2: any) {
 		const { name, ...rest1 } = pkg1
 		const { name: name2, ...rest2 } = pkg2
 		return JSON.stringify(rest1) === JSON.stringify(rest2)
 	}
-	const app1PkgJson =
-		app1.dev.type === 'script'
-			? await fsExtra.readJSON(path.join(app1.fullPath, 'package.json'))
+	async function readPkgJson(app: App) {
+		return app.dev.type === 'script'
+			? await fsExtra
+					.readJSON(path.join(app.fullPath, 'package.json'))
+					.catch(() => ({}))
 			: {}
-	const app2PkgJson =
-		app1.dev.type === 'script'
-			? await fsExtra.readJSON(path.join(app2.fullPath, 'package.json'))
-			: {}
+	}
+	const app1PkgJson = app1.dev.type === 'script' ? await readPkgJson(app1) : {}
+	const app2PkgJson = app2.dev.type === 'script' ? await readPkgJson(app2) : {}
 	const pkgJsonIgnore: Array<string> = comparePkgJson(app1PkgJson, app2PkgJson)
 		? ['package.json']
 		: []
@@ -302,21 +303,44 @@ async function getDiffIgnore(filePath: string): Promise<Array<string>> {
 		: []
 }
 
-function getForceFreshForDiff(
+// returns true if one of the apps has been modified since the cache was created
+// specially coded to ensure we return as soon as it is determined that one of
+// the apps has been modified since the cache was created without waiting for
+// the other app to finish calculating its modified time. Could save tens of
+// milliseconds which is probably unnecesary... but it was fun to think about...
+async function getForceFreshForDiff(
 	app1: App,
 	app2: App,
 	cacheEntry: CacheEntry | null | undefined,
 ) {
 	if (!cacheEntry) return true
-	const app1Modified = modifiedTimes.get(app1.fullPath) ?? 0
-	const app2Modified = modifiedTimes.get(app2.fullPath) ?? 0
+
 	const cacheModified = cacheEntry.metadata.createdTime
-	return (
-		!cacheModified ||
-		app1Modified > cacheModified ||
-		app2Modified > cacheModified ||
-		undefined
+	if (!cacheModified) return true
+
+	const app1ModifiedRecentlyPromise = getDirModifiedTime(app1.fullPath).then(
+		(modified) => modified > cacheModified,
 	)
+	const app2ModifiedRecentlyPromise = getDirModifiedTime(app2.fullPath).then(
+		(modified) => modified > cacheModified,
+	)
+
+	const bothFinishedPromise = Promise.all([
+		app1ModifiedRecentlyPromise,
+		app2ModifiedRecentlyPromise,
+	]).then(() => false)
+
+	const oneModifiedRecently = await Promise.race([
+		app1ModifiedRecentlyPromise.then((recent) =>
+			recent ? true : bothFinishedPromise,
+		),
+		app2ModifiedRecentlyPromise.then((recent) =>
+			recent ? true : bothFinishedPromise,
+		),
+	])
+	if (oneModifiedRecently) return true
+
+	return undefined
 }
 
 export async function getDiffFiles(
@@ -333,7 +357,8 @@ export async function getDiffFiles(
 	const result = await cachified({
 		key,
 		cache: diffFilesCache,
-		forceFresh: forceFresh || getForceFreshForDiff(app1, app2, cacheEntry),
+		forceFresh:
+			forceFresh || (await getForceFreshForDiff(app1, app2, cacheEntry)),
 		timings,
 		request,
 		getFreshValue: () => getDiffFilesImpl(app1, app2),
@@ -410,10 +435,12 @@ export async function getDiffCode(
 ) {
 	const key = `${app1.relativePath}__vs__${app2.relativePath}`
 	const cacheEntry = diffCodeCache.get(key)
+
 	const result = await cachified({
 		key,
 		cache: diffCodeCache,
-		forceFresh: forceFresh || getForceFreshForDiff(app1, app2, cacheEntry),
+		forceFresh:
+			forceFresh || (await getForceFreshForDiff(app1, app2, cacheEntry)),
 		timings,
 		request,
 		getFreshValue: () => getDiffCodeImpl(app1, app2),

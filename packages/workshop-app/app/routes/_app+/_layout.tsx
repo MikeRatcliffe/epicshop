@@ -32,6 +32,7 @@ import { useHydrated } from 'remix-utils/use-hydrated'
 import { Icon } from '#app/components/icons.tsx'
 import { makeMediaQueryStore } from '#app/components/media-query.ts'
 import { Logo } from '#app/components/product.tsx'
+import { RevalidationWS } from '#app/components/revalidation-ws.js'
 import {
 	Dialog,
 	DialogContent,
@@ -306,6 +307,7 @@ export default function App() {
 					<Outlet />
 				</div>
 			</div>
+			<RevalidationWS watchPaths={['./exercises/README.mdx']} />
 		</div>
 	)
 }

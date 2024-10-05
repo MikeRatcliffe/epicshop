@@ -26,7 +26,10 @@ import {
 	getWorkshopConfig,
 } from './config.server.js'
 import { getEnv, init as initEnv } from './env.server.js'
-import { getDirModifiedTime } from './modified-time.server.js'
+import {
+	getDirModifiedTime,
+	modifiedMoreRecentlyThan,
+} from './modified-time.server.js'
 import {
 	closeProcess,
 	isAppRunning,
@@ -36,7 +39,10 @@ import {
 import { getServerTimeHeader, type Timings } from './timing.server.js'
 import { getErrorMessage } from './utils.js'
 
-let initialized = false
+declare global {
+	var __epicshop_apps_initialized__: boolean | undefined
+}
+global.__epicshop_apps_initialized__ = false
 
 export const workshopRoot = (process.env.EPICSHOP_CONTEXT_CWD =
 	process.env.EPICSHOP_CONTEXT_CWD ?? process.cwd())
@@ -213,9 +219,9 @@ async function firstToExist(...files: Array<string>) {
 }
 
 export async function init() {
-	if (initialized) return
+	if (global.__epicshop_apps_initialized__) return
 
-	initialized = true
+	global.__epicshop_apps_initialized__ = true
 	const config = getWorkshopConfig()
 	process.env.EPICSHOP_GITHUB_REPO = config.githubRepo
 	process.env.EPICSHOP_GITHUB_ROOT = config.githubRoot
@@ -258,8 +264,15 @@ export async function init() {
 			},
 		})
 
+		let lastCallTime = 0
+
 		watcher.on('all', () => {
-			void getApps({ forceFresh: true })
+			const now = Date.now()
+			if (now - lastCallTime > 100) {
+				lastCallTime = now
+				lastAppConfigChangeTime = now
+				void getApps({ forceFresh: true })
+			}
 		})
 
 		closeWithGrace(() => watcher.close())
@@ -392,15 +405,21 @@ export async function getExercises({
 }
 
 let appCallCount = 0
+let lastAppConfigChangeTime = 0
 
 export async function getApps({
 	timings,
 	request,
 	forceFresh,
 }: CachifiedOptions & { forceFresh?: boolean } = {}): Promise<Array<App>> {
-	if (!initialized) await init()
+	await init()
 
 	const key = 'apps'
+	const currentEntry = await appsCache.get(key)
+	if (!forceFresh && currentEntry) {
+		const currentEntryTime = currentEntry.metadata.createdTime
+		forceFresh = lastAppConfigChangeTime > currentEntryTime
+	}
 	const apps = await cachified({
 		key,
 		cache: appsCache,
@@ -409,7 +428,8 @@ export async function getApps({
 		request,
 		// This entire cache is to avoid a single request getting a fresh value
 		// multiple times unnecessarily (because getApps is called many times per request)
-		ttl: 1000 * 60 * 60 * 24,
+		ttl: 1000 * 10,
+		swr: 1000 * 60 * 60 * 24,
 		forceFresh,
 		getFreshValue: async () => {
 			// FIXME: this is incredibly slow and I don't know what to do about it...
@@ -605,7 +625,7 @@ async function findSolutionDir({
 		const { stepNumber } = info
 		const paddedStepNumber = stepNumber.toString().padStart(2, '0')
 		const parentDir = path.dirname(fullPath)
-		const siblingDirs = await fs.promises.readdir(parentDir)
+		const siblingDirs = await readDir(parentDir)
 		const solutionDir = siblingDirs.find((dir) =>
 			dir.startsWith(`${paddedStepNumber}.solution`),
 		)
@@ -635,7 +655,7 @@ async function findProblemDir({
 		const { stepNumber } = info
 		const paddedStepNumber = stepNumber.toString().padStart(2, '0')
 		const parentDir = path.dirname(fullPath)
-		const siblingDirs = await fs.promises.readdir(parentDir)
+		const siblingDirs = await readDir(parentDir)
 		const problemDir = siblingDirs.find(
 			(dir) => dir.endsWith('problem') && dir.includes(paddedStepNumber),
 		)
@@ -669,7 +689,7 @@ async function getTestInfo({
 	// tests are found in the corresponding solution directory
 	const testAppFullPath = (await findSolutionDir({ fullPath })) ?? fullPath
 
-	const dirList = await fs.promises.readdir(testAppFullPath)
+	const dirList = await readDir(testAppFullPath)
 	const testFiles = dirList.filter((item) => item.includes('.test.'))
 	if (testFiles.length) {
 		return {

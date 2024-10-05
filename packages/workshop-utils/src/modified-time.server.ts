@@ -18,7 +18,7 @@ async function getDirModifiedTime(
 	return result
 }
 
-export async function getDirModifiedTimeImpl(dir: string): Promise<number> {
+async function getDirModifiedTimeImpl(dir: string): Promise<number> {
 	const isIgnored = await isGitIgnored({ cwd: dir })
 	const files = await fs.promises
 		.readdir(dir, { withFileTypes: true })
@@ -52,6 +52,21 @@ export async function getDirModifiedTimeImpl(dir: string): Promise<number> {
 	}
 
 	return Math.max(-1, ...modifiedTimes)
+}
+
+// this will return true as soon as one of the directories has been found to
+// have been modified more recently than the given time
+export async function modifiedMoreRecentlyThan(
+	time: number,
+	...dirs: Array<string>
+) {
+	const modifiedTimePromises = dirs.map((dir) => getDirModifiedTime(dir))
+	const allFinishedPromise = Promise.all(modifiedTimePromises)
+	const firstMoreRecentPromise = modifiedTimePromises.map((p) =>
+		p.then((t) => (t > time ? true : allFinishedPromise.then(() => false))),
+	)
+	const firstMoreRecent = await Promise.race(firstMoreRecentPromise)
+	return firstMoreRecent
 }
 
 let _queue: PQueue | null = null

@@ -21,7 +21,7 @@ export const problemAppCache = makeSingletonCache<ProblemApp>('ProblemAppCache')
 export const exampleAppCache = makeSingletonCache<ExampleApp>('ExampleAppCache')
 export const playgroundAppCache =
 	makeSingletonCache<PlaygroundApp>('PlaygroundAppCache')
-export const appsCache = makeSingletonCache<App>('AppsCache')
+export const appsCache = makeSingletonFsCache<App>('AppsCache')
 export const diffCodeCache = makeSingletonCache<string>('DiffCodeCache')
 export const diffFilesCache = makeSingletonCache<string>('DiffFilesCache')
 export const compiledMarkdownCache = makeSingletonCache<string>(

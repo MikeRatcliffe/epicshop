@@ -13,7 +13,7 @@ import {
 	diffFilesCache,
 } from '@epic-web/workshop-utils/cache.server'
 import { compileMarkdownString } from '@epic-web/workshop-utils/compile-mdx.server'
-import { getDirModifiedTime } from '@epic-web/workshop-utils/modified-time.server'
+import { modifiedMoreRecentlyThan } from '@epic-web/workshop-utils/modified-time.server'
 import { type Timings } from '@epic-web/workshop-utils/timing.server'
 import { execa } from 'execa'
 import fsExtra from 'fs-extra'
@@ -303,11 +303,6 @@ async function getDiffIgnore(filePath: string): Promise<Array<string>> {
 		: []
 }
 
-// returns true if one of the apps has been modified since the cache was created
-// specially coded to ensure we return as soon as it is determined that one of
-// the apps has been modified since the cache was created without waiting for
-// the other app to finish calculating its modified time. Could save tens of
-// milliseconds which is probably unnecesary... but it was fun to think about...
 async function getForceFreshForDiff(
 	app1: App,
 	app2: App,
@@ -318,27 +313,12 @@ async function getForceFreshForDiff(
 	const cacheModified = cacheEntry.metadata.createdTime
 	if (!cacheModified) return true
 
-	const app1ModifiedRecentlyPromise = getDirModifiedTime(app1.fullPath).then(
-		(modified) => modified > cacheModified,
+	const modifiedMoreRecently = await modifiedMoreRecentlyThan(
+		cacheModified,
+		app1.fullPath,
+		app2.fullPath,
 	)
-	const app2ModifiedRecentlyPromise = getDirModifiedTime(app2.fullPath).then(
-		(modified) => modified > cacheModified,
-	)
-
-	const bothFinishedPromise = Promise.all([
-		app1ModifiedRecentlyPromise,
-		app2ModifiedRecentlyPromise,
-	]).then(() => false)
-
-	const oneModifiedRecently = await Promise.race([
-		app1ModifiedRecentlyPromise.then((recent) =>
-			recent ? true : bothFinishedPromise,
-		),
-		app2ModifiedRecentlyPromise.then((recent) =>
-			recent ? true : bothFinishedPromise,
-		),
-	])
-	if (oneModifiedRecently) return true
+	if (modifiedMoreRecently) return true
 
 	return undefined
 }

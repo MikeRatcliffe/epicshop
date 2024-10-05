@@ -49,7 +49,15 @@ export default defineConfig({
 	build: {
 		cssMinify: MODE === 'production',
 		rollupOptions: {
-			external: [/node:.*/, 'stream', 'crypto', 'fsevents', 'globby'],
+			external: [
+				/node:.*/,
+				'stream',
+				'crypto',
+				'fsevents',
+				'globby',
+				'@epic-web/workshop-utils',
+				'@epic-web/workshop-presence',
+			],
 		},
 	},
 	resolve: { alias: aliases },
